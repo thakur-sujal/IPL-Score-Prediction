@@ -339,16 +339,89 @@ import scipy.stats as stats
 
 
 # --- Helper Functions ---
-def calculate_win_probability(predicted_score, target_score, runs_std_dev=20):
+def calculate_win_probability(predicted_score, target_score, current_runs=0,
+                              current_overs=0.0, current_wickets=0, runs_last_5=0):
     """
     Calculate win probability for the chasing team.
-    Assumes the prediction error follows a normal distribution.
-    runs_std_dev: Standard deviation of the model's prediction errors (approx 20 runs)
+    Uses a situational heuristic for early overs (< 5) and a blended
+    model + situational approach for mid/late innings (>= 5 overs).
     """
-    # Probability that the chasing team scores > target
-    # This is 1 - CDF(target) on the distribution N(predicted, std_dev)
-    win_prob = 1 - stats.norm.cdf(target_score, loc=predicted_score, scale=runs_std_dev)
-    return win_prob
+    # Edge cases: match already decided
+    if current_runs >= target_score:
+        return 1.0  # Chasing team won
+    if current_wickets >= 10:
+        return 0.0  # All out
+    if current_overs >= 20.0 and current_runs < target_score:
+        return 0.0  # Overs exhausted
+
+    runs_needed = target_score - current_runs
+    balls_left = 120 - int(current_overs * 6)
+    if balls_left <= 0:
+        return 0.0
+
+    required_rr = (runs_needed / balls_left) * 6
+
+    # ── EARLY INNINGS (< 5 overs): RRR-based heuristic ──────────────
+    # The model predicts cumulative score-so-far, not final total, so its
+    # output is unreliable at low overs. Use required run-rate instead.
+    if current_overs < 5.0:
+        if required_rr <= 6.0:
+            base_prob = 0.80 + (6.0 - required_rr) * 0.03      # up to ~98%
+        elif required_rr <= 10.0:
+            base_prob = 0.80 - (required_rr - 6.0) * 0.10      # 80% → 40%
+        elif required_rr <= 15.0:
+            base_prob = 0.40 - (required_rr - 10.0) * 0.07     # 40% → 5%
+        else:
+            base_prob = max(0.02, 0.05 - (required_rr - 15.0) * 0.01)
+
+        # Wicket penalty even in early overs
+        if current_wickets >= 3:
+            base_prob *= max(0.3, 1.0 - (current_wickets - 2) * 0.12)
+
+        return max(0.01, min(0.99, base_prob))
+
+    # ── MID / LATE INNINGS (>= 5 overs): Model + Situation blend ────
+    # Dynamic std_dev: high uncertainty early → low uncertainty late
+    overs_fraction = current_overs / 20.0
+    dynamic_std = max(8, int(45 * (1 - overs_fraction)))
+
+    # 1. Model-based probability
+    model_prob = 1 - stats.norm.cdf(target_score - 0.5,
+                                     loc=predicted_score, scale=dynamic_std)
+
+    # 2. Situational probability from required run-rate
+    if required_rr <= 6.0:
+        sit_prob = 0.85 + (6.0 - required_rr) * 0.02
+    elif required_rr <= 10.0:
+        sit_prob = 0.85 - (required_rr - 6.0) * 0.12           # 85% → 37%
+    elif required_rr <= 15.0:
+        sit_prob = 0.37 - (required_rr - 10.0) * 0.06          # 37% → 7%
+    else:
+        sit_prob = max(0.02, 0.07 - (required_rr - 15.0) * 0.01)
+
+    # 3. Blend: give more weight to model as overs increase
+    model_weight = min(0.7, overs_fraction * 1.2)
+    blended_prob = model_weight * model_prob + (1 - model_weight) * sit_prob
+
+    # 4. Momentum adjustment (recent scoring rate vs required)
+    if runs_last_5 > 0:
+        recent_rr = (runs_last_5 / 30) * 6
+        if recent_rr >= required_rr:
+            rr_ratio = recent_rr / max(required_rr, 1.0)
+            momentum_boost = min(0.15, (rr_ratio - 1.0) * 0.10)
+            blended_prob += momentum_boost
+        else:
+            rr_ratio = recent_rr / max(required_rr, 1.0)
+            momentum_penalty = min(0.15, (1.0 - rr_ratio) * 0.15)
+            blended_prob -= momentum_penalty
+
+    # 5. Progressive wicket penalty (kicks in after significant collapse)
+    if current_wickets >= 6:
+        wicket_factor = max(0.2, 1.0 - (current_wickets - 5) * 0.15)
+        blended_prob *= wicket_factor
+
+    # Bound between 1% and 99% for active matches
+    return max(0.01, min(0.99, blended_prob))
 
 
 # --- Initialize Session State ---
@@ -710,7 +783,14 @@ with tab2:
         predicted_final_score = model.predict(input_features, verbose=0)[0][0]
 
         # Calculate Win Probability
-        win_prob = calculate_win_probability(predicted_final_score, target_score)
+        win_prob = calculate_win_probability(
+            predicted_score=predicted_final_score, 
+            target_score=target_score, 
+            current_runs=runs_t2, 
+            current_overs=overs_t2, 
+            current_wickets=wickets_t2,
+            runs_last_5=runs_last_5_t2
+        )
         win_percentage = int(win_prob * 100)
 
         # Display Results
@@ -786,7 +866,7 @@ st.markdown("---")
 st.markdown(
     """
 <div class="footer">
-    <p>🏏 <strong>IPL Score Predictor Pro</strong> | Built by <strong>SUJAL MEENA</strong></p>
+    <p>🏏 <strong>IPL Score Predictor Pro</strong>  </strong></p>
     <p style="font-size: 0.8rem; color: #555;">Powered by Advanced AI & Streamlit</p>
     <p style="font-size: 1.2rem; color: white; margin-top: 10px; font-weight: bold;">Note: Enable Dark Mode for the best-looking interface.</p>
 </div>
